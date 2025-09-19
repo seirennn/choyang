@@ -1,20 +1,32 @@
 const express = require('express');
 const multer = require('multer');
 const { Storage } = require('@google-cloud/storage');
-const cors = require('cors');
 const path = require('path');
 require('dotenv').config();
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
+// Configure Google Cloud Storage
+console.log('Configuring Google Cloud Storage...');
+console.log('Project ID:', process.env.GOOGLE_CLOUD_PROJECT_ID);
+console.log('Key file path:', process.env.GOOGLE_APPLICATION_CREDENTIALS || './service-account-key.json');
+console.log('Bucket name:', process.env.GCS_BUCKET_NAME);
+
+const storage = new Storage({
+  projectId: process.env.GOOGLE_CLOUD_PROJECT_ID,
+  keyFilename: process.env.GOOGLE_APPLICATION_CREDENTIALS || './service-account-key.json'
+});
+
+const bucket = storage.bucket(process.env.GCS_BUCKET_NAME);
+
 // Middleware
-app.use(cors());
-app.use(express.json());
 app.use(express.static('public'));
+app.use(express.urlencoded({ extended: true }));
+app.use(express.json());
 
 // Configure multer for memory storage
-const upload = multer({ 
+const upload = multer({
   storage: multer.memoryStorage(),
   limits: {
     fileSize: 5 * 1024 * 1024, // 5MB limit
@@ -28,82 +40,172 @@ const upload = multer({
   }
 });
 
-// Initialize Google Cloud Storage
-const storage = new Storage({
-  projectId: process.env.GOOGLE_CLOUD_PROJECT_ID,
-  keyFilename: process.env.GOOGLE_CLOUD_KEY_FILE || './gcs-key.json'
-});
-
-const bucketName = process.env.GCS_BUCKET_NAME || 'choyang-cloud-storage-bucket';
-const bucket = storage.bucket(bucketName);
+// Function to fetch all images from GCS bucket
+async function fetchImagesFromBucket() {
+  try {
+    console.log('Fetching images from GCS bucket...');
+    
+    // List all files in the uploads/ directory
+    const [files] = await bucket.getFiles({
+      prefix: 'uploads/',
+      delimiter: '/'
+    });
+    
+    // Filter only image files and create image objects
+    const imageFiles = files.filter(file => {
+      const fileName = file.name.toLowerCase();
+      return fileName.match(/\.(jpg|jpeg|png|gif|webp|bmp|svg)$/i);
+    });
+    
+    // Get metadata for each image file
+    const images = await Promise.all(
+      imageFiles.map(async (file) => {
+        try {
+          const [metadata] = await file.getMetadata();
+          return {
+            id: file.name.replace(/[^a-zA-Z0-9]/g, ''), // Create unique ID from filename
+            originalName: path.basename(file.name),
+            fileName: file.name,
+            name: file.name,
+            url: `/image/${file.name}`,
+            uploadTime: metadata.timeCreated || new Date().toISOString(),
+            uploadDate: metadata.timeCreated || new Date().toISOString(),
+            size: metadata.size || 0,
+            contentType: metadata.contentType || 'image/jpeg'
+          };
+        } catch (error) {
+          console.error(`Error getting metadata for ${file.name}:`, error);
+          return null;
+        }
+      })
+    );
+    
+    // Filter out null results and sort by upload date (newest first)
+    const validImages = images
+      .filter(img => img !== null)
+      .sort((a, b) => new Date(b.uploadDate) - new Date(a.uploadDate));
+    
+    console.log(`Found ${validImages.length} images in bucket`);
+    return validImages;
+    
+  } catch (error) {
+    console.error('Error fetching images from bucket:', error);
+    return [];
+  }
+}
 
 // Routes
-app.get('/', (req, res) => {
+app.get('/', async (req, res) => {
   res.sendFile(path.join(__dirname, 'public', 'index.html'));
 });
 
-// Upload endpoint
 app.post('/upload', upload.single('image'), async (req, res) => {
   try {
     if (!req.file) {
-      return res.status(400).json({ error: 'No file uploaded' });
+      return res.status(400).json({ error: 'Please select an image file' });
     }
 
-    const fileName = `${Date.now()}-${req.file.originalname}`;
-    const file = bucket.file(fileName);
+    console.log('Starting upload process...');
+    console.log('Project ID:', process.env.GOOGLE_CLOUD_PROJECT_ID);
+    console.log('Bucket Name:', process.env.GCS_BUCKET_NAME);
+    console.log('File:', req.file.originalname, 'Size:', req.file.size);
 
-    const stream = file.createWriteStream({
+    // Generate unique filename with uploads/ prefix
+    const fileName = `uploads/${Date.now()}-${Math.round(Math.random() * 1E9)}${path.extname(req.file.originalname)}`;
+    
+    // Create a file in the bucket
+    const file = bucket.file(fileName);
+    
+    // Upload using save method - no ACL operations for uniform bucket-level access
+    await file.save(req.file.buffer, {
       metadata: {
         contentType: req.file.mimetype,
       },
-      public: true,
+      validation: 'md5'
     });
 
-    stream.on('error', (err) => {
-      console.error('Upload error:', err);
-      res.status(500).json({ error: 'Upload failed' });
+    // File uploaded successfully - generate URL through our server
+    const publicUrl = `/image/${fileName}`;
+    
+    console.log('Upload successful! Internal URL:', publicUrl);
+    console.log('Image uploaded to GCS:', fileName);
+    
+    res.json({
+      message: 'Upload successful',
+      fileName: fileName,
+      url: publicUrl
     });
 
-    stream.on('finish', async () => {
-      // Make the file public
-      await file.makePublic();
-      
-      const publicUrl = `https://storage.googleapis.com/${bucketName}/${fileName}`;
-      
-      res.json({
-        message: 'Upload successful',
-        fileName: fileName,
-        url: publicUrl
-      });
-    });
-
-    stream.end(req.file.buffer);
   } catch (error) {
     console.error('Upload error:', error);
-    res.status(500).json({ error: 'Upload failed' });
+    console.error('Error details:', error.message);
+    
+    res.status(500).json({ 
+      error: `Failed to upload image to Google Cloud Storage: ${error.message}`
+    });
+  }
+});
+
+// Serve images through our server as proxy (more secure than public bucket)
+app.get('/image/:folder/:filename', async (req, res) => {
+  try {
+    // Reconstruct the full path from parameters
+    const filename = `${req.params.folder}/${req.params.filename}`;
+    console.log('Serving image:', filename);
+    
+    const file = bucket.file(filename);
+    
+    // Check if file exists
+    const [exists] = await file.exists();
+    if (!exists) {
+      return res.status(404).json({ error: 'Image not found' });
+    }
+    
+    // Get file metadata to set proper content type
+    const [metadata] = await file.getMetadata();
+    
+    // Set appropriate headers
+    res.set({
+      'Content-Type': metadata.contentType || 'image/jpeg',
+      'Cache-Control': 'public, max-age=86400', // Cache for 24 hours
+    });
+    
+    // Stream the file from GCS to the response
+    const stream = file.createReadStream();
+    
+    stream.on('error', (error) => {
+      console.error('Stream error:', error);
+      if (!res.headersSent) {
+        res.status(500).json({ error: 'Failed to load image' });
+      }
+    });
+    
+    stream.pipe(res);
+    
+  } catch (error) {
+    console.error('Error serving image:', error);
+    res.status(500).json({ error: 'Internal server error' });
   }
 });
 
 // Get all images endpoint
 app.get('/images', async (req, res) => {
   try {
-    const [files] = await bucket.getFiles();
-    
-    const imageFiles = files
-      .filter(file => {
-        const metadata = file.metadata;
-        return metadata.contentType && metadata.contentType.startsWith('image/');
-      })
-      .map(file => ({
-        name: file.name,
-        url: `https://storage.googleapis.com/${bucketName}/${file.name}`,
-        uploadTime: file.metadata.timeCreated
-      }))
-      .sort((a, b) => new Date(b.uploadTime) - new Date(a.uploadTime));
-
-    res.json(imageFiles);
+    const images = await fetchImagesFromBucket();
+    res.json(images);
   } catch (error) {
-    console.error('Error fetching images:', error);
+    console.error('Error fetching images for API:', error);
+    res.status(500).json({ error: 'Failed to fetch images' });
+  }
+});
+
+// API endpoint to get images as JSON
+app.get('/api/images', async (req, res) => {
+  try {
+    const images = await fetchImagesFromBucket();
+    res.json(images);
+  } catch (error) {
+    console.error('Error fetching images for API:', error);
     res.status(500).json({ error: 'Failed to fetch images' });
   }
 });
@@ -129,16 +231,17 @@ app.get('/health', (req, res) => {
 });
 
 // Error handling middleware
-app.use((error, req, res, next) => {
+app.use(async (error, req, res, next) => {
   if (error instanceof multer.MulterError) {
     if (error.code === 'LIMIT_FILE_SIZE') {
-      return res.status(400).json({ error: 'File too large' });
+      return res.status(400).json({ error: 'File too large. Maximum size is 5MB.' });
     }
   }
+  
   res.status(500).json({ error: error.message });
 });
 
 app.listen(PORT, () => {
-  console.log(`🚀 Server running on port ${PORT}`);
-  console.log(`📱 Visit: http://localhost:${PORT}`);
+  console.log(`Server running on port ${PORT}`);
+  console.log(`Environment: ${process.env.NODE_ENV || 'development'}`);
 });

@@ -54,7 +54,7 @@ gcloud projects add-iam-policy-binding $project_id \
 
 # Create service account key
 echo "🗝️  Creating service account key..."
-gcloud iam service-accounts keys create gcs-key.json \
+gcloud iam service-accounts keys create service-account-key.json \
     --iam-account=$sa_name@$project_id.iam.gserviceaccount.com
 
 # Create .env file
@@ -62,17 +62,17 @@ echo "📄 Creating .env file..."
 cat > .env << EOF
 # Google Cloud Storage Configuration
 GOOGLE_CLOUD_PROJECT_ID=$project_id
-GOOGLE_CLOUD_KEY_FILE=./gcs-key.json
 GCS_BUCKET_NAME=$bucket_name
+GOOGLE_APPLICATION_CREDENTIALS=./service-account-key.json
 
-# Server Configuration
+# App Configuration
 PORT=3000
 NODE_ENV=development
 EOF
 
 # Convert key to base64 for Render deployment
 echo "🔄 Converting key to base64 for Render..."
-base64_key=$(base64 -i gcs-key.json)
+base64_key=$(base64 -i service-account-key.json)
 echo "📋 Base64 encoded key for Render (copy this):"
 echo "=================================="
 echo $base64_key
@@ -86,7 +86,7 @@ echo "1. Copy the base64 key above"
 echo "2. Set environment variables in Render:"
 echo "   - GOOGLE_CLOUD_PROJECT_ID=$project_id"
 echo "   - GCS_BUCKET_NAME=$bucket_name"
-echo "   - GOOGLE_CLOUD_KEY_FILE=<paste-base64-key>"
+echo "   - GOOGLE_APPLICATION_CREDENTIALS=<paste-base64-key>"
 echo "3. Deploy to Render"
 echo ""
 echo "🧪 To test locally:"
