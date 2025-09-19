@@ -1,0 +1,21 @@
+services:
+  - type: web
+    name: choyang-cloud-storage-app
+    env: node
+    buildCommand: npm install
+    startCommand: npm start
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        fromService:
+          type: web
+          name: choyang-cloud-storage-app
+          property: port
+      # Add these environment variables in Render dashboard:
+      # - GOOGLE_CLOUD_PROJECT_ID
+      # - GCS_BUCKET_NAME  
+      # - GOOGLE_CLOUD_KEY_FILE (base64 encoded service account JSON)
+    
+    # Optional: Configure health check
+    healthCheckPath: /health
